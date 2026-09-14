@@ -18,18 +18,19 @@ npm install gateway-workers   # workspace / git / file: path to packages/gateway
 ## Host app (thin route)
 
 ```ts
-import { GatewayTelegramAdapter, createTelegramWebhookHandler } from "@bobbybacklogs/gateway-telegram";
+import { GatewayTelegramAdapter, createTelegramWebhookHandler, parseTelegramOperatorAllowlist } from "@bobbybacklogs/gateway-telegram";
 
 const adapter = new GatewayTelegramAdapter({
   botToken: process.env.TELEGRAM_BOT_TOKEN!,
   webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET!,
+  allowedChatIds: parseTelegramOperatorAllowlist(process.env.TELEGRAM_ALLOWED_CHAT_IDS),
   rootDir: process.env.GWORK_SWARM_WORKSPACE || process.cwd(),
 });
 
 export const POST = createTelegramWebhookHandler(adapter);
 ```
 
-Set `GWORK_SWARM_WORKSPACE` to the swarm workspace `rootDir` (registry/office). Model keys (`AI_GATEWAY_API_KEY`, etc.) are whatever `orchestrateChat` already needs — still **in this process**, not another server.
+Set `GWORK_SWARM_WORKSPACE` to the swarm workspace `rootDir` (registry/office). Set `TELEGRAM_ALLOWED_CHAT_IDS` to the operator’s Telegram chat and/or user id (comma-separated). **Empty fail-closed** — webhook `secret_token` authenticates Telegram’s servers, not whoever DMs the bot. Model keys (`AI_GATEWAY_API_KEY`, etc.) are whatever `orchestrateChat` already needs — still **in this process**, not another server.
 
 `POST /api/chat` on gwork is an optional UI host. The SDK does not fetch it.
 
