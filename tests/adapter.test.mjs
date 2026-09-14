@@ -7,7 +7,9 @@ import { readRegistry } from "gateway-workers";
 import {
   GatewayTelegramAdapter,
   parseTelegramCommand,
+  parseTelegramOperatorAllowlist,
   telegramOffered,
+  telegramOperatorAllowed,
   TELEGRAM_SUBAGENT_CAP,
   TELEGRAM_A2A_DEPTH_CAP,
 } from "../dist/index.js";
@@ -37,6 +39,7 @@ describe("In-process Telegram adapter (no Gateway HTTP sidecar)", () => {
       const adapter = new GatewayTelegramAdapter({
         botToken: "123:test",
         webhookSecret: "sec",
+        allowedChatIds: [9],
         rootDir: tempDir,
         fetch: async (url, init) => {
           telegramUrls.push(String(url));
@@ -83,6 +86,7 @@ describe("In-process Telegram adapter (no Gateway HTTP sidecar)", () => {
       const adapter = new GatewayTelegramAdapter({
         botToken: "123:test",
         rootDir: tempDir,
+        allowedChatIds: [4],
         fetch: async (url) => {
           fetches.push(String(url));
           return jsonResponse({ ok: true, result: true });
@@ -124,5 +128,51 @@ describe("In-process Telegram adapter (no Gateway HTTP sidecar)", () => {
         }),
       /rootDir/
     );
+  });
+
+  it("5. Empty operator allowlist fail-closes /hire (webhook secret is not user auth)", async () => {
+    assert.deepEqual(parseTelegramOperatorAllowlist(""), []);
+    assert.equal(
+      telegramOperatorAllowed({ allowlist: [], chatId: 9, userId: 9 }),
+      false
+    );
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "tg-inproc-deny-"));
+    try {
+      const telegramUrls = [];
+      const adapter = new GatewayTelegramAdapter({
+        botToken: "123:test",
+        webhookSecret: "sec",
+        allowedChatIds: [],
+        rootDir: tempDir,
+        fetch: async (url) => {
+          telegramUrls.push(String(url));
+          return jsonResponse({ ok: true, result: true });
+        },
+        orchestrateChat: () => {
+          throw new Error("chat should not run for forbidden /hire");
+        },
+      });
+      const result = await adapter.handleUpdate({
+        update_id: 1,
+        message: {
+          message_id: 1,
+          chat: { id: 9 },
+          from: { id: 9 },
+          text: "/hire Ledger | Own month-end. Never invent numbers.",
+        },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.action, "forbidden");
+      const registry = await readRegistry(tempDir);
+      assert.equal(
+        Object.values(registry).some((b) =>
+          String(b.name).toLowerCase().includes("ledger")
+        ),
+        false
+      );
+      assert.equal(telegramUrls.length, 0);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });

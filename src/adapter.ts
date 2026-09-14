@@ -43,6 +43,11 @@ export type OrchestrateChatFn = (input: {
 export type GatewayTelegramAdapterOptions = {
   botToken: string;
   webhookSecret?: string;
+  /**
+   * Operator chat and/or user ids. Empty (or omitted with empty env) fail-closed.
+   * Webhook secret authenticates Telegram servers, not the human.
+   */
+  allowedChatIds?: number[];
   /** Swarm workspace root (same as upsertBot rootDir). */
   rootDir: string;
   fetch?: typeof globalThis.fetch;
@@ -61,9 +66,42 @@ export function telegramOffered(
   return Boolean((env.TELEGRAM_BOT_TOKEN || "").trim());
 }
 
+/** Comma/space-separated Telegram chat or user ids. Invalid tokens skipped. */
+export function parseTelegramOperatorAllowlist(
+  raw: string | undefined | null
+): number[] {
+  const text = (raw || "").trim();
+  if (!text) return [];
+  const out: number[] = [];
+  for (const part of text.split(/[\s,]+/)) {
+    if (!part || !/^-?\d+$/.test(part)) continue;
+    const n = Number(part);
+    if (!Number.isSafeInteger(n)) continue;
+    out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Empty allowlist rejects. Chat id or user id may match (private DMs share the id).
+ * Does not treat webhook secret as operator auth.
+ */
+export function telegramOperatorAllowed(opts: {
+  allowlist: number[];
+  chatId?: number | null;
+  userId?: number | null;
+}): boolean {
+  if (!opts.allowlist.length) return false;
+  const allowed = new Set(opts.allowlist);
+  if (opts.chatId != null && allowed.has(opts.chatId)) return true;
+  if (opts.userId != null && allowed.has(opts.userId)) return true;
+  return false;
+}
+
 export class GatewayTelegramAdapter {
   readonly api: TelegramBotApi;
   readonly webhookSecret: string;
+  readonly operatorAllowlist: number[];
   readonly rootDir: string;
   readonly skillsDir?: string;
   private hitl: TelegramHitlStore;
@@ -85,6 +123,13 @@ export class GatewayTelegramAdapter {
         fetch: options.fetch || globalThis.fetch.bind(globalThis),
       });
     this.webhookSecret = (options.webhookSecret || "").trim();
+    this.operatorAllowlist = Array.isArray(options.allowedChatIds)
+      ? options.allowedChatIds.slice()
+      : parseTelegramOperatorAllowlist(
+          typeof process !== "undefined"
+            ? process.env.TELEGRAM_ALLOWED_CHAT_IDS
+            : ""
+        );
     this.skillsDir = options.skillsDir;
     this.hitl = options.hitlStore || new MemoryHitlStore();
     this.orchestrateFn = options.orchestrateChat || orchestrateChat;
@@ -94,6 +139,14 @@ export class GatewayTelegramAdapter {
   verifyWebhookSecret(header: string | null | undefined): boolean {
     if (!this.webhookSecret) return false;
     return telegramWebhookSecretMatches(header, this.webhookSecret);
+  }
+
+  private isOperator(chatId?: number | null, userId?: number | null): boolean {
+    return telegramOperatorAllowed({
+      allowlist: this.operatorAllowlist,
+      chatId,
+      userId,
+    });
   }
 
   setWebhook(url: string) {
@@ -109,6 +162,9 @@ export class GatewayTelegramAdapter {
     if (update.callback_query) return this.handleCallback(update);
     const message = update.message || update.edited_message;
     if (!message?.chat?.id) return { ok: true, action: "ignored" };
+    if (!this.isOperator(message.chat.id, message.from?.id)) {
+      return { ok: false, action: "forbidden" };
+    }
     const text = (message.text || message.caption || "").trim();
     if (!text) return { ok: true, action: "ignored" };
     return this.handleText(message.chat.id, text);
@@ -118,9 +174,13 @@ export class GatewayTelegramAdapter {
     update: TelegramUpdate
   ): Promise<{ ok: boolean; action: string }> {
     const cq = update.callback_query!;
+    const chatId = cq.message?.chat.id;
+    const userId = cq.from?.id;
+    if (!this.isOperator(chatId, userId)) {
+      return { ok: false, action: "forbidden" };
+    }
     const parsed = parseTelegramCallbackData(cq.data || "");
     await this.api.answerCallbackQuery(cq.id);
-    const chatId = cq.message?.chat.id;
     if (!parsed || chatId == null) {
       if (chatId != null) {
         await this.reply(chatId, "This approval token is unknown or expired.");
