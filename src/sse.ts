@@ -1,101 +1,166 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Readable } from "node:stream";
+export type TelegramSseHandlers = {
+  onAssistantText: (text: string, worker?: string) => Promise<void>;
+  onApprovalPending: (info: {
+    requestId: string;
+    subagentId: string;
+    botName?: string;
+    taskTitle?: string;
+  }) => Promise<void>;
+  onMentionSkip?: (info: {
+    name: string;
+    reason: string;
+    detail?: string;
+  }) => Promise<void>;
+};
 
-const SSE_HEADERS = {
-  "Content-Type": "text/event-stream; charset=utf-8",
-  "Cache-Control": "no-cache, no-transform",
-  Connection: "keep-alive",
-  "X-Accel-Buffering": "no",
-} as const;
-
-export function writeSseHeaders(res: ServerResponse): void {
-  for (const [key, value] of Object.entries(SSE_HEADERS)) {
-    res.setHeader(key, value);
-  }
-  res.flushHeaders?.();
-}
-
-export function writeSseEvent(
-  res: ServerResponse,
-  event: string,
-  data: unknown,
-): void {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
-export async function streamSseFromReadable(
-  body: Readable,
-  res: ServerResponse,
-): Promise<void> {
-  writeSseHeaders(res);
-  await new Promise<void>((resolve, reject) => {
-    body.on("data", (chunk: Buffer | string) => {
-      res.write(chunk);
-    });
-    body.on("end", () => resolve());
-    body.on("error", reject);
-  });
-}
-
-export async function writeSseFromJson(
-  res: ServerResponse,
-  payload: unknown,
-): Promise<void> {
-  writeSseHeaders(res);
-  if (
-    payload &&
-    typeof payload === "object" &&
-    "error" in payload &&
-    typeof (payload as { error?: unknown }).error === "string"
-  ) {
-    writeSseEvent(res, "error", { error: (payload as { error: string }).error });
-    writeSseEvent(res, "done", {});
-    res.end();
-    return;
-  }
-  const text =
-    payload && typeof payload === "object" && "text" in payload
-      ? String((payload as { text?: unknown }).text ?? "")
-      : "";
-  writeSseEvent(res, "meta", { source: "telegram" });
-  if (text) {
-    writeSseEvent(res, "delta", { text });
-  }
-  writeSseEvent(res, "done", {});
-  res.end();
-}
-
-export async function writeSseFromFetchResponse(
-  res: ServerResponse,
+export async function consumeAgentSse(
   response: Response,
-): Promise<void> {
+  handlers: TelegramSseHandlers
+): Promise<{ requestId?: string }> {
   if (!response.body) {
-    writeSseHeaders(res);
-    writeSseEvent(res, "error", { error: "empty_stream" });
-    writeSseEvent(res, "done", {});
-    res.end();
-    return;
+    const text = await response.text().catch(() => "");
+    if (text) await handlers.onAssistantText(text);
+    return {};
   }
-  writeSseHeaders(res);
+
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(decoder.decode(value, { stream: true }));
-    }
-    res.end();
-  } catch (error) {
-    writeSseEvent(res, "error", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    writeSseEvent(res, "done", {});
-    res.end();
-  }
-}
+  let buffer = "";
+  let requestId: string | undefined;
+  let turnBuf = "";
+  let turnWorker: string | undefined;
+  const seenApprovals = new Set<string>();
+  const subBuf = new Map<string, { text: string; botName?: string }>();
 
-export function isSseRequest(req: IncomingMessage): boolean {
-  const accept = String(req.headers.accept ?? "");
-  return accept.includes("text/event-stream");
+  const flushTurn = async () => {
+    const text = turnBuf.trim();
+    turnBuf = "";
+    if (text) await handlers.onAssistantText(text, turnWorker);
+  };
+
+  const handleEvent = async (raw: string) => {
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (typeof event.requestId === "string") requestId = event.requestId;
+    const type = String(event.type || "");
+    const botName =
+      typeof event.botName === "string" ? event.botName : undefined;
+    const subagent =
+      event.subagent && typeof event.subagent === "object"
+        ? (event.subagent as Record<string, unknown>)
+        : undefined;
+    const subId =
+      (typeof event.subagentId === "string" && event.subagentId) ||
+      (typeof subagent?.id === "string" ? subagent.id : undefined);
+
+    switch (type) {
+      case "turn_chunk":
+      case "turn_followup_chunk":
+        if (typeof event.chunk === "string") turnBuf += event.chunk;
+        if (botName) turnWorker = botName;
+        break;
+      case "turn_complete":
+        await flushTurn();
+        break;
+      case "subagent_start": {
+        const status = String(subagent?.status || event.status || "");
+        const step = String(subagent?.activeStep || event.activeStep || "");
+        const pending =
+          status === "pending" || /awaiting approval/i.test(step);
+        if (pending && requestId && subId && !seenApprovals.has(subId)) {
+          seenApprovals.add(subId);
+          await handlers.onApprovalPending({
+            requestId,
+            subagentId: subId,
+            botName:
+              (typeof subagent?.botName === "string" && subagent.botName) ||
+              botName,
+            taskTitle:
+              typeof subagent?.taskTitle === "string"
+                ? subagent.taskTitle
+                : undefined,
+          });
+        }
+        break;
+      }
+      case "subagent_chunk":
+        if (subId && typeof event.chunk === "string") {
+          const cur = subBuf.get(subId) || {
+            text: "",
+            botName:
+              (typeof subagent?.botName === "string" && subagent.botName) ||
+              botName,
+          };
+          cur.text += event.chunk;
+          subBuf.set(subId, cur);
+        }
+        break;
+      case "subagent_complete": {
+        if (subId) {
+          const cur = subBuf.get(subId);
+          const output =
+            (typeof subagent?.output === "string" && subagent.output) ||
+            cur?.text ||
+            "";
+          const worker =
+            (typeof subagent?.botName === "string" && subagent.botName) ||
+            cur?.botName ||
+            botName;
+          if (output.trim()) {
+            await handlers.onAssistantText(output.trim(), worker);
+          }
+          subBuf.delete(subId);
+        }
+        break;
+      }
+      case "mention_skip": {
+        const mention = event.mention as
+          | { name?: string; reason?: string; detail?: string }
+          | undefined;
+        if (mention?.name && handlers.onMentionSkip) {
+          await handlers.onMentionSkip({
+            name: mention.name,
+            reason: mention.reason || "skipped",
+            detail: mention.detail,
+          });
+        }
+        break;
+      }
+      case "done":
+        await flushTurn();
+        break;
+      default:
+        break;
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      const dataLines = frame
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).trimStart());
+      const raw = dataLines.join("\n");
+      if (raw) await handleEvent(raw);
+    }
+  }
+  if (buffer.trim()) {
+    const dataLines = buffer
+      .split("\n")
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).trimStart());
+    const raw = dataLines.join("\n");
+    if (raw) await handleEvent(raw);
+  }
+  await flushTurn();
+  return { requestId };
 }
