@@ -1,0 +1,40 @@
+{
+  "name": "@bobbybacklogs/gateway-telegram",
+  "version": "0.1.0",
+  "description": "In-process Telegram adapter for Gateway Workers. Host mounts the webhook; hire/A2A/skills/approval via imported gateway-workers library calls. No sidecar, no npm run dev.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "test": "tsc && node --test tests/*.test.mjs"
+  },
+  "peerDependencies": {
+    "gateway-workers": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "gateway-workers": "file:../Gateway-Workers/packages/gateway-workers",
+    "typescript": "^5.8.2"
+  },
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bobbybacklogs/gateway-telegram.git"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
