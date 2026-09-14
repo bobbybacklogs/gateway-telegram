@@ -1,6 +1,8 @@
 export {
   GatewayTelegramAdapter,
   telegramOffered,
+  parseTelegramOperatorAllowlist,
+  telegramOperatorAllowed,
   TELEGRAM_SUBAGENT_CAP,
   TELEGRAM_A2A_DEPTH_CAP,
 } from "./adapter.js";
